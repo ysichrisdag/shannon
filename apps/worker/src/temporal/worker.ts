@@ -28,6 +28,7 @@
  *   TEMPORAL_ADDRESS - Temporal server address (default: localhost:7233)
  */
 
+import { mkdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client, Connection, type WorkflowHandle, WorkflowNotFoundError } from '@temporalio/client';
@@ -40,7 +41,8 @@ import { CAPELLA_FORMAT_VERSION, CAPELLA_PROMPT_SET_VERSION } from '../ai/sast/c
 import { summarizeOperationalMetrics } from '../audit/operational-summary.js';
 import { sanitizeHostname } from '../audit/utils.js';
 import { distributeConfig, parseConfig } from '../config-parser.js';
-import { deliverablesDir, resolveSessionJsonPath } from '../paths.js';
+import { deliverablesDir, INTERNAL_DIR, resolveSessionJsonPath, STARTUP_ERROR_FILENAME } from '../paths.js';
+import { PentestError } from '../services/error-handling.js';
 import { isProviderFailureCategory } from '../types/errors.js';
 import {
   ACCEPTED_CAPELLA_FAILURE_STAGES,
@@ -73,6 +75,7 @@ import {
   runAuthVulnAgent,
   runAuthzExploitAgent,
   runAuthzVulnAgent,
+  runCyberAccessVerification,
   runInjectionExploitAgent,
   runInjectionVulnAgent,
   runMiscellaneousExploitAgent,
@@ -145,6 +148,7 @@ export const PENTEST_ACTIVITY_NAMES = Object.freeze([
   'runMiscellaneousExploitAgent',
   'runReportAgent',
   'runPreflightValidation',
+  'runCyberAccessVerification',
   'runAuthenticationValidation',
   'initDeliverableGit',
   'syncPlaywrightStealthConfig',
@@ -185,6 +189,7 @@ export const pentestActivities = Object.freeze({
   runMiscellaneousExploitAgent,
   runReportAgent,
   runPreflightValidation,
+  runCyberAccessVerification,
   runAuthenticationValidation,
   initDeliverableGit,
   syncPlaywrightStealthConfig,
@@ -245,6 +250,8 @@ interface CliArgs {
   configPath?: string;
   customerOutputPath?: string;
   pipelineTestingMode: boolean;
+  authOnly: boolean;
+  validateModel: boolean;
   resumeFromWorkspace?: string;
 }
 
@@ -259,7 +266,9 @@ function showUsage(): void {
   console.log('  --config <path>        Configuration file path');
   console.log('  --workspace <name>     Resume from existing workspace');
   console.log('  --output <path>        Stable mounted path for final customer report copies');
-  console.log('  --pipeline-testing     Use minimal prompts for fast testing\n');
+  console.log('  --pipeline-testing     Use minimal prompts for fast testing');
+  console.log('  --validate-auth        Validate authentication only, then stop');
+  console.log('  --validate-model       Validate the AI model only, then stop\n');
 }
 
 function parseCliArgs(argv: string[]): CliArgs {
@@ -275,6 +284,8 @@ function parseCliArgs(argv: string[]): CliArgs {
   let configPath: string | undefined;
   let customerOutputPath: string | undefined;
   let pipelineTestingMode = false;
+  let authOnly = false;
+  let validateModel = false;
   let resumeFromWorkspace: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
@@ -311,6 +322,10 @@ function parseCliArgs(argv: string[]): CliArgs {
       }
     } else if (arg === '--pipeline-testing') {
       pipelineTestingMode = true;
+    } else if (arg === '--validate-auth') {
+      authOnly = true;
+    } else if (arg === '--validate-model') {
+      validateModel = true;
     } else if (arg && !arg.startsWith('-')) {
       if (!webUrl) {
         webUrl = arg;
@@ -338,6 +353,8 @@ function parseCliArgs(argv: string[]): CliArgs {
     taskQueue,
     ...(workflowId && { workflowId }),
     pipelineTestingMode,
+    authOnly,
+    validateModel,
     ...(configPath && { configPath }),
     ...(customerOutputPath && { customerOutputPath }),
     ...(resumeFromWorkspace && { resumeFromWorkspace }),
@@ -511,31 +528,61 @@ interface OrchestrationConfig {
   exploit?: boolean;
 }
 
+/**
+ * Parse the scan config into orchestration values, or throw on a broken config. Failing (rather
+ * than falling back to defaults that quietly change scope) lets the caller persist parseConfig's
+ * error for the CLI instead of running a misconfigured scan.
+ */
 async function loadOrchestrationConfig(configPath: string | undefined): Promise<OrchestrationConfig> {
   if (!configPath) return {};
-  try {
-    const config = await parseConfig(configPath);
-    const distributed = distributeConfig(config);
-    const codePathAvoids = distributed.avoid.filter((rule) => rule.type === 'code_path').map((rule) => rule.value);
-    const codePathFocus = distributed.focus.filter((rule) => rule.type === 'code_path').map((rule) => rule.value);
+  const config = await parseConfig(configPath);
+  const distributed = distributeConfig(config);
+  const codePathAvoids = distributed.avoid.filter((rule) => rule.type === 'code_path').map((rule) => rule.value);
+  const codePathFocus = distributed.focus.filter((rule) => rule.type === 'code_path').map((rule) => rule.value);
 
-    return {
-      ...(distributed.agenticSast && {
-        agenticSast: {
-          codePathAvoids,
-          codePathFocus,
-          modelSpec: process.env.SHANNON_AI_MODEL?.trim() || DEFAULT_MODEL_SPEC,
-          capellaFormatVersion: CAPELLA_FORMAT_VERSION,
-          promptSetVersion: CAPELLA_PROMPT_SET_VERSION,
-        },
-      }),
-      exploit: distributed.exploit,
-    };
-  } catch (error) {
-    // A broken config must fail the run, not silently fall back to empty
-    // defaults that quietly change scope (vuln classes, exploit, retries).
-    console.error('Worker configuration could not be loaded. Reference code: CONFIG_VALIDATION_FAILED');
-    process.exit(1);
+  return {
+    ...(distributed.agenticSast && {
+      agenticSast: {
+        codePathAvoids,
+        codePathFocus,
+        modelSpec: process.env.SHANNON_AI_MODEL?.trim() || DEFAULT_MODEL_SPEC,
+        capellaFormatVersion: CAPELLA_FORMAT_VERSION,
+        promptSetVersion: CAPELLA_PROMPT_SET_VERSION,
+      },
+    }),
+    exploit: distributed.exploit,
+  };
+}
+
+// === Startup Failure Persistence ===
+
+/** Reason for a failure that happens before the workflow is created. */
+interface StartupErrorRecord {
+  phase: string;
+  code?: string;
+  message: string;
+}
+
+/**
+ * Persist a pre-workflow failure to the bind-mounted workspace so the CLI can surface it. The
+ * worker exits before the workflow exists, so Temporal has no record and `--rm` removes the
+ * container; the file under INTERNAL_DIR outlives it on the host mount. `workspace` is the CLI's
+ * `--workspace` name (the run directory); absent only when the worker is run off the CLI path.
+ * Best-effort — a persist failure must not mask the original error.
+ */
+function persistStartupError(workspace: string | undefined, error: unknown, phase: string): void {
+  if (!workspace) return;
+  const record: StartupErrorRecord = {
+    phase,
+    ...(error instanceof PentestError && error.code !== undefined && { code: error.code }),
+    message: error instanceof Error ? error.message : String(error),
+  };
+  try {
+    const dir = path.join('./workspaces', workspace, INTERNAL_DIR);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, STARTUP_ERROR_FILENAME), JSON.stringify(record, null, 2), 'utf8');
+  } catch {
+    // A broken bind mount must not compound the failure; the caller's console.error still fires.
   }
 }
 
@@ -556,6 +603,8 @@ function buildPipelineInput(
     ...(args.customerOutputPath !== undefined && { customerOutputPath: args.customerOutputPath }),
     ...(orchestration.agenticSast !== undefined && { agenticSast: orchestration.agenticSast }),
     ...(orchestration.exploit !== undefined && { exploit: orchestration.exploit }),
+    ...(args.authOnly && { authOnly: true }),
+    ...(args.validateModel && { validateModel: true }),
   };
 }
 
@@ -610,6 +659,10 @@ async function waitForWorkflowResult(
       }
     } else if (result.status === 'cancelled') {
       console.log('\nScan cancelled before it finished.');
+    } else if (result.authOnly) {
+      console.log('\nAuthentication validated. No pentest was run (--validate-auth).');
+    } else if (result.validateModel) {
+      console.log('\nModel validated. No pentest was run (--validate-model).');
     } else {
       console.log('\nScan completed.');
     }
@@ -655,24 +708,26 @@ async function waitForWorkflowResult(
 
 // === Main Entry Point ===
 
-async function run(): Promise<void> {
-  // 1. Parse CLI args
-  const args = parseCliArgs(process.argv.slice(2));
+/** A scan whose workflow is durably submitted, with the handles run() needs to await it. */
+interface StartedScan {
+  handle: WorkflowHandle<(input: PipelineInput) => Promise<PipelineState>>;
+  workspace: WorkspaceResolution;
+  worker: Worker;
+  workerDone: Promise<void>;
+}
 
-  // 2. Connect to Temporal server
-  const address = process.env.TEMPORAL_ADDRESS || 'localhost:7233';
-  console.log(`Connecting to Temporal at ${address}...`);
-
-  const connection = await NativeConnection.connect({ address });
-  const clientConnection = await Connection.connect({ address });
-  const client = new Client({ connection: clientConnection });
-
+/**
+ * Run every step that precedes the durable creation of the workflow: config parsing, workspace
+ * resolution, worker setup, and workflow submission. A failure anywhere here is a startup failure
+ * — Temporal holds no record yet — so the reason is persisted for the CLI before it propagates.
+ */
+async function startScan(client: Client, connection: NativeConnection, args: CliArgs): Promise<StartedScan> {
   try {
-    // 3. Validate orchestration and resume state before terminating any workflow.
+    // 1. Validate orchestration and resume state before terminating any workflow.
     const orchestration = await loadOrchestrationConfig(args.configPath);
     const workspace = await resolveWorkspace(client, args, orchestration.exploit ?? true);
 
-    // 4. Bundle workflows and create the worker with the collision-checked activity registry.
+    // 2. Bundle workflows and create the worker with the collision-checked activity registry.
     console.log('Preparing scan...');
     const workflowBundle = await bundleWorkflowCode({
       workflowsPath: path.join(__dirname, 'workflows.js'),
@@ -695,13 +750,11 @@ async function run(): Promise<void> {
       maxConcurrentActivityTaskExecutions: 25,
     });
 
-    // 5. Build the fixed-scope pipeline input.
+    // 3. Build the fixed-scope pipeline input and start worker polling in the background.
     const input = buildPipelineInput(args, workspace, orchestration);
-
-    // 6. Start worker polling in the background.
     const workerDone = worker.run();
 
-    // 7. Submit workflow to the same task queue.
+    // 4. Submit workflow to the same task queue. Past this point the run exists in Temporal.
     const handle = await client.workflow.start<(input: PipelineInput) => Promise<PipelineState>>(
       'pentestPipelineWorkflow',
       {
@@ -711,10 +764,38 @@ async function run(): Promise<void> {
       },
     );
 
-    // 8. Wait for workflow result.
+    return { handle, workspace, worker, workerDone };
+  } catch (startupError) {
+    persistStartupError(args.resumeFromWorkspace, startupError, 'startup');
+    throw startupError;
+  }
+}
+
+async function run(): Promise<void> {
+  // 1. Parse CLI args
+  const args = parseCliArgs(process.argv.slice(2));
+
+  // One scan per worker process, so an auth-only or model-validation run is a process-wide fact.
+  // The log writers read these to frame the log as a validation rather than a pentest.
+  if (args.authOnly) process.env.SHANNON_AUTH_ONLY = '1';
+  if (args.validateModel) process.env.SHANNON_VALIDATE_MODEL = '1';
+
+  // 2. Connect to Temporal server
+  const address = process.env.TEMPORAL_ADDRESS || 'localhost:7233';
+  console.log(`Connecting to Temporal at ${address}...`);
+
+  const connection = await NativeConnection.connect({ address });
+  const clientConnection = await Connection.connect({ address });
+  const client = new Client({ connection: clientConnection });
+
+  try {
+    // 3. Start the scan: parse config, resolve the workspace, and submit the workflow.
+    const { handle, workspace, worker, workerDone } = await startScan(client, connection, args);
+
+    // 4. Wait for workflow result.
     await waitForWorkflowResult(handle, workspace);
 
-    // 9. Shut down worker gracefully. Final customer copies are workflow-owned.
+    // 5. Shut down worker gracefully. Final customer copies are workflow-owned.
     worker.shutdown();
     await workerDone;
   } finally {
@@ -725,8 +806,10 @@ async function run(): Promise<void> {
 
 const invokedPath = process.argv[1] ? path.resolve(process.argv[1]) : undefined;
 if (invokedPath === fileURLToPath(import.meta.url)) {
-  run().catch(() => {
-    console.error('Worker failed. Reference code: WORKER_FAILED');
+  run().catch((error) => {
+    // startScan persists pre-workflow failures for the CLI; this also logs them in the container.
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Worker failed: ${message}`);
     process.exit(1);
   });
 }

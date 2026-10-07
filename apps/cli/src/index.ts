@@ -61,6 +61,18 @@ function blockSudo(): void {
   );
 }
 
+/** Refuse to run on native Windows. WSL2 reports `linux`, so it is unaffected. */
+function blockNativeWindows(): void {
+  if (process.platform !== 'win32') return;
+
+  failWith(
+    'CLI_PRECONDITION_FAILED',
+    'Shannon does not run on native Windows.',
+    'Run Shannon inside WSL2. Setup instructions:',
+    'https://github.com/KeygraphHQ/shannon/blob/main/docs/platforms.md',
+  );
+}
+
 /** Commands whose `--json` output contract extends to failures. */
 const JSON_CAPABLE_COMMANDS = new Set(['status', 'scans', 'version', '--version', '-v']);
 
@@ -177,6 +189,8 @@ interface ParsedStartArgs {
   pipelineTesting: boolean;
   keepContainer: boolean;
   follow: boolean;
+  authOnly: boolean;
+  validateModel: boolean;
 }
 
 function parseStartArgs(argv: string[]): ParsedStartArgs {
@@ -193,6 +207,8 @@ function parseStartArgs(argv: string[]): ParsedStartArgs {
       pipelineTesting: ['--pipeline-testing'],
       keepContainer: ['--keep-container'],
       follow: ['-f', '--follow'],
+      authOnly: ['--validate-auth'],
+      validateModel: ['--validate-model'],
     },
   });
 
@@ -208,12 +224,25 @@ function parseStartArgs(argv: string[]): ParsedStartArgs {
     failUsage(`invalid --url: ${url}`);
   }
 
+  if (flags.authOnly && flags.validateModel) {
+    failUsage('--validate-auth and --validate-model cannot be combined; run one validation at a time');
+  }
+
+  if (flags.authOnly && !values.config) {
+    failUsage(
+      '--validate-auth needs a config file with an authentication block',
+      `Usage: ${commandPrefix()} start -u <url> -r <path> -c <config.yaml> --validate-auth`,
+    );
+  }
+
   return {
     url,
     repo,
     pipelineTesting: !!flags.pipelineTesting,
     keepContainer: !!flags.keepContainer,
     follow: !!flags.follow,
+    authOnly: !!flags.authOnly,
+    validateModel: !!flags.validateModel,
     ...(values.config && { config: values.config }),
     ...(values.modelsConfig && { modelsConfig: values.modelsConfig }),
     ...(values.workspace && { workspace: values.workspace }),
@@ -262,6 +291,7 @@ async function main(): Promise<void> {
     enableJsonErrors();
   }
 
+  blockNativeWindows();
   blockSudo();
 
   const args = process.argv.slice(2);

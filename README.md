@@ -1,5 +1,5 @@
 > [!NOTE]
-> **[Shannon 3.0 is live](https://github.com/KeygraphHQ/shannon/discussions/439):** deeper security code analysis, more thoroughly vetted findings, a rebuilt CLI, native CI/CD, professional PDF reports, and SARIF.
+> **[Cyber verification for Anthropic and OpenAI models](https://github.com/KeygraphHQ/shannon/discussions/483):** complete your provider's cyber verification program to prevent model failures and refusals during cyber workloads.
 
 <div align="center">
 
@@ -131,8 +131,8 @@ These reports are from Shannon Open Source scans of Photoview 2.4.0, one of the 
 
 - **Docker**: required for the worker container.
 - **Node.js 18+**: required for the recommended `npx` workflow.
-- **AI provider credentials**: Shannon runs on Anthropic, OpenAI, xAI, AWS Bedrock, and [any other provider](docs/ai-providers.md#any-other-provider) in the harness catalogue — each of which you can point at a proxy or LLM gateway through a [custom base URL](docs/ai-providers.md#custom-base-url), and a model the catalogue does not yet carry can be described with a [custom model configuration](docs/ai-providers.md#custom-model-configuration). You bring your own key, and Keygraph never proxies your model traffic. Shannon is provider-agnostic. See [AI providers](docs/ai-providers.md#suggested-models) for suggested model IDs.
-- **Cyber safeguards cleared with your provider**: Anthropic and OpenAI apply real-time safeguards to cyber-security workloads, which can interrupt a scan mid-run. Complete their guidance for legitimate security testers before your first run - see [AI providers](docs/ai-providers.md#cyber-safeguards-do-this-before-your-first-scan).
+- **AI provider credentials**: Shannon runs on Anthropic, OpenAI, xAI, AWS Bedrock, and [any other provider](docs/ai-providers.md#any-other-provider) in the harness catalogue — each of which you can point at a proxy or LLM gateway through a [custom base URL](docs/ai-providers.md#custom-base-url), and a model the catalogue does not carry can be described with a [custom model configuration](docs/ai-providers.md#custom-model-configuration). You bring your own key, and Keygraph never proxies your model traffic. Shannon is provider-agnostic. See [AI providers](docs/ai-providers.md#suggested-models) for suggested model IDs.
+- **Cyber safeguards cleared with your provider**: Anthropic and OpenAI apply real-time safeguards to cyber-security workloads, which can interrupt a scan mid-run. Complete their guidance for legitimate security testers before your first run - see [AI providers](docs/ai-providers.md#cyber-safeguards-do-this-before-your-first-scan) and the [cyber verification announcement](https://github.com/KeygraphHQ/shannon/discussions/483).
 
 
 
@@ -375,7 +375,7 @@ Yes. Shannon emits SARIF 2.1.0, the OASIS standard format for static analysis re
 
 ### Which AI providers does Shannon support?
 
-Anthropic, OpenAI, xAI, and AWS Bedrock are built in and configured directly by provider ID. Beyond those, Shannon runs on any provider in the Pi harness catalogue, named the same `<provider>:<model-id>` way. Any provider can be pointed at a proxy or LLM gateway through a custom base URL, which overrides only the endpoint and keeps that provider's API dialect. A model the catalogue does not yet carry, such as one released after Shannon's pinned harness version, runs without waiting for a Shannon release. Describe it in a [custom model configuration](docs/ai-providers.md#custom-model-configuration) file and pass it with `--models-config`. Shannon uses a single unified model setting throughout a pentest.
+Anthropic, OpenAI, xAI, and AWS Bedrock are built in and configured directly by provider ID. Beyond those, Shannon runs on any provider in the Pi harness catalogue, named the same `<provider>:<model-id>` way. Any provider can be pointed at a proxy or LLM gateway through a custom base URL, which overrides only the endpoint and keeps that provider's API dialect. A model the catalogue does not carry, such as one a router or gateway serves under its own ID, or a self-hosted model, is described in a [custom model configuration](docs/ai-providers.md#custom-model-configuration) file and passed with `--models-config`. Shannon uses a single unified model setting throughout a pentest.
 
 ### Can I run Shannon on a local or self-hosted model?
 

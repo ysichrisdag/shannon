@@ -360,7 +360,6 @@ function shouldSkipHostsName(name: string, hostname: string): boolean {
  */
 function forwardEtcHostsFlags(): string[] {
   if (!envBool('SHANNON_FORWARD_HOSTS', true)) return [];
-  if (os.platform() === 'win32') return [];
 
   let content: string;
   try {
@@ -413,6 +412,8 @@ export interface WorkerOptions {
   workspace: string;
   pipelineTesting?: boolean;
   keepContainer?: boolean;
+  authOnly?: boolean;
+  validateModel?: boolean;
   piAuthHostPath?: string;
 }
 
@@ -512,13 +513,17 @@ export function spawnWorker(opts: WorkerOptions): ChildProcess {
   if (opts.pipelineTesting) {
     args.push('--pipeline-testing');
   }
+  if (opts.authOnly) {
+    args.push('--validate-auth');
+  }
+  if (opts.validateModel) {
+    args.push('--validate-model');
+  }
 
   // Inherit stderr so `docker run` daemon errors surface to the user;
   // ignore stdin/stdout (the container ID is noise).
   return spawn('docker', args, {
     stdio: ['ignore', 'ignore', 'inherit'],
-    // Prevent MSYS/Git Bash from converting Unix paths on Windows
-    ...(os.platform() === 'win32' && { env: { ...process.env, MSYS_NO_PATHCONV: '1' } }),
   });
 }
 
